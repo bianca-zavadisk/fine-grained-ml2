@@ -1,0 +1,1 @@
+#  Para o dataset SLICE-3D, serão usados os dados de 2020
