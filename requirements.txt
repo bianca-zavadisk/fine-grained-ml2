@@ -9,3 +9,4 @@ torchvision==0.26.0+cu128
 torchsummary
 scikit-learn
 grad-cam
+requests
