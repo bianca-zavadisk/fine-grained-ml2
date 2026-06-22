@@ -112,6 +112,20 @@ def _find_gt_csv(base: Path) -> Path:
             return c
     return candidates[0]
 
+def _is_dataset_prepared(root: Path) -> bool:
+    """
+    Retorna True se o dataset já estiver organizado em root com os três splits
+    (cada split contendo 'images' e 'ground_truth.csv').
+    """
+    required_splits = ("train", "val", "test")
+    for s in required_splits:
+        split_dir = root / s
+        img_dir = split_dir / "images"
+        gt_file = split_dir / "ground_truth.csv"
+        if not (img_dir.exists() and gt_file.exists()):
+            return False
+    return True
+
 
 def download_isic2018(root: str | Path = "./data/isic2018", keep_zips: bool = False) -> None:
     """
@@ -123,6 +137,11 @@ def download_isic2018(root: str | Path = "./data/isic2018", keep_zips: bool = Fa
     keep_zips : se True, mantém os arquivos .zip após extração.
     """
     root = Path(root)
+    
+    if _is_dataset_prepared(root):
+        print(f"✓ Dados já preparados em: {root.resolve()} — pulando download/extração.")
+        return
+    
     cache = root / "_cache"
     cache.mkdir(parents=True, exist_ok=True)
 
