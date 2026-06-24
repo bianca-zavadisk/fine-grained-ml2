@@ -1,226 +1,256 @@
 import torch
-from tqdm.auto import tqdm
 import numpy as np
 import matplotlib.pyplot as plt
-import modules.visualizations as visu
+from sklearn.metrics import roc_auc_score, average_precision_score, precision_score, recall_score, f1_score, balanced_accuracy_score, auc
+from sklearn.preprocessing import label_binarize
+from modules.pipeline import evaluate_classification
+from modules.binary_pipeline import GenericEarlyStopping, train_one_epoch
+from modules.visualizations import roc_curve, log_pr_curve_multiclass, plot_top_errors_multiclass, log_gradcam_tensorboard
 
-class GenericEarlyStopping:
-    def __init__(
-        self,
-        patience=5,
-        min_delta=0.0,
-        mode='max',  # 'max' para AUC, F1; 'min' para loss
-        path='checkpoint.pt'
-    ):
-        self.patience = patience
-        self.min_delta = min_delta
-        self.mode = mode
-        self.path = path
-
-        self.counter = 0
-        self.best_score = None
-        self.early_stop = False
-
-    def __call__(self, current_score, model):
-
-        if self.best_score is None:
-            self.best_score = current_score
-            self.save_checkpoint(model)
-            return
-
-        if self.mode == 'max':
-            improved = current_score > self.best_score + self.min_delta
-        else:
-            improved = current_score < self.best_score - self.min_delta
-
-        if improved:
-            self.best_score = current_score
-            self.counter = 0
-            self.save_checkpoint(model)
-        else:
-            self.counter += 1
-            print(f"EarlyStopping counter: {self.counter}/{self.patience}")
-
-            if self.counter >= self.patience:
-                self.early_stop = True
-
-    def save_checkpoint(self, model):
-        torch.save(model.state_dict(), self.path)
-
-def train_one_epoch(model, loader, optimizer, criterion, device, epoch_idx=None, writer=None, model_type="model"):
-    model.train()
-
-    total_loss = 0.0
-    
-    # Contadores globais
-    correct_global = 0
-    total_global = 0
-    
-    # Contadores por classe (0 = Benigno, 1 = Maligno)
-    correct_0 = 0
-    total_0 = 0
-    correct_1 = 0
-    total_1 = 0
-
-    desc = f"Epoch {epoch_idx}" if epoch_idx else "Train"
-    loop = tqdm(loader, desc=desc, total=len(loader), unit='batch', leave=False, dynamic_ncols=True)
-
-    for batch_idx, (inputs, labels) in enumerate(loop, start=1):
-        inputs = inputs.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
-
-        outputs = model(inputs)
-        loss = criterion(outputs, labels)
-
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-        total_loss += loss.item() * inputs.size(0)
-        
-        if outputs.dim() == 1 or outputs.shape[1] == 1:
-            probs = torch.sigmoid(outputs.view(-1))
-            predicted = (probs > 0.5).long()
-        else:
-            _, predicted = outputs.max(1)
-
-        # Usamos view(-1) para garantir tensores 1D, facilitando a lógica abaixo
-        predicted_cpu = predicted.cpu().view(-1)
-        labels_cpu = labels.cpu().view(-1)
-
-        # --- 1. Acurácia Global ---
-        total_global += labels_cpu.size(0)
-        correct_global += predicted_cpu.eq(labels_cpu).sum().item()
-
-        # --- 2. Acurácia Ponderada (Otimizada para o loop) ---
-        mask_0 = (labels_cpu == 0)
-        mask_1 = (labels_cpu == 1)
-        
-        total_0 += mask_0.sum().item()
-        total_1 += mask_1.sum().item()
-        
-        correct_0 += (predicted_cpu[mask_0] == 0).sum().item()
-        correct_1 += (predicted_cpu[mask_1] == 1).sum().item()
-        
-        # Proteção contra divisão por zero nos primeiros batches
-        recall_0 = correct_0 / total_0 if total_0 > 0 else 0.0
-        recall_1 = correct_1 / total_1 if total_1 > 0 else 0.0
-        
-        current_loss = total_loss / total_global
-        current_acc_global = correct_global / total_global
-        current_acc_pond = (recall_0 + recall_1) / 2.0
-
-        # --- 3. Atualiza a barra de progresso ---
-        loop.set_postfix(
-            loss=f"{current_loss:.4f}", 
-            acc=f"{current_acc_global:.4f}", 
-            acc_pond=f"{current_acc_pond:.4f}"
-        )
-
-        if writer is not None:
-            global_step = (epoch_idx - 1) * len(loader) + batch_idx if epoch_idx else batch_idx
-            writer.add_scalar(f'{model_type}/batch_loss', loss.item(), global_step)
-            if batch_idx == 1 and epoch_idx == 1:
-                try:
-                    imgs = inputs.detach().cpu()[:4]
-                    writer.add_images(f'{model_type}/examples', imgs, epoch_idx)
-                except Exception:
-                    pass
-
-        del outputs, loss, predicted, inputs, labels, predicted_cpu, labels_cpu, mask_0, mask_1
-        if device.type == 'cuda':
-            torch.cuda.empty_cache()
-
-    avg_loss = total_loss / len(loader.dataset)
-    final_acc_global = correct_global / total_global
-    final_acc_pond = (recall_0 + recall_1) / 2.0 # pyright: ignore[reportPossiblyUnboundVariable, reportOperatorIssue]
-    
-    # Agora a função retorna também a acurácia ponderada de treino final
-    return avg_loss, final_acc_global, final_acc_pond
-
-from sklearn.metrics import balanced_accuracy_score, f1_score, precision_score, recall_score, roc_auc_score, average_precision_score
+class_names = [
+    "MEL",
+    "NV",
+    "BCC",
+    "AKIEC",
+    "BLK",
+    "DF",
+    "VASC"
+]
 
 @torch.no_grad()
 def evaluate(model, loader, criterion, device):
+
     model.eval()
 
     total_loss = 0.0
+
     all_targets = []
     all_preds = []
     all_probs = []
 
     for inputs, labels in loader:
-        inputs, labels = inputs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
+
+        inputs = inputs.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
 
         outputs = model(inputs)
+
         loss = criterion(outputs, labels)
 
         total_loss += loss.item() * inputs.size(0)
-        
-        # Extrai probabilidades para a classe positiva (maligno)
-        if outputs.dim() == 1 or outputs.shape[1] == 1:
-            probs = torch.sigmoid(outputs.view(-1))
-            preds = (probs > 0.5).long()
-            probs_pos = probs
-        else:
-            probs = torch.softmax(outputs, dim=1)
-            preds = outputs.argmax(dim=1)
-            probs_pos = probs[:, 1]
+
+        probs = torch.softmax(outputs, dim=1)
+
+        preds = probs.argmax(dim=1)
 
         all_targets.extend(labels.cpu().numpy())
         all_preds.extend(preds.cpu().numpy())
-        all_probs.extend(probs_pos.cpu().numpy())
-
-        del outputs, loss, inputs, labels
-        if device.type == 'cuda':
-            torch.cuda.empty_cache()
+        all_probs.extend(probs.cpu().numpy())
 
     avg_loss = total_loss / len(loader.dataset)
-    
+
     y_true = np.array(all_targets)
     y_pred = np.array(all_preds)
     y_prob = np.array(all_probs)
 
+    num_classes = y_prob.shape[1]
+
+    from sklearn.preprocessing import label_binarize
+    # One-hot labels for ROC-AUC and PR-AUC
+    y_true_bin = label_binarize(
+        y_true,
+        classes=np.arange(num_classes)
+    )
+
+    # -------------------------
+    # ROC-AUC
+    # -------------------------
     try:
-        roc_auc = roc_auc_score(y_true, y_prob)
+        roc_auc = roc_auc_score(
+            y_true_bin,
+            y_prob,
+            average="macro",
+            multi_class="ovr"
+        )
     except ValueError:
         roc_auc = 0.0
 
+    # -------------------------
+    # PR-AUC
+    # -------------------------
     try:
-        pr_auc = average_precision_score(y_true, y_prob)
+        pr_auc = average_precision_score(
+            y_true_bin,
+            y_prob,
+            average="macro"
+        )
     except ValueError:
         pr_auc = 0.0
-    
-    # Gera todas as métricas necessárias para dados desbalanceados
+
+    # -------------------------
+    # Per-class metrics
+    # -------------------------
+    precision_per_class = precision_score(
+        y_true,
+        y_pred,
+        average=None,
+        zero_division=0
+    )
+
+    recall_per_class = recall_score(
+        y_true,
+        y_pred,
+        average=None,
+        zero_division=0
+    )
+
+    f1_per_class = f1_score(
+        y_true,
+        y_pred,
+        average=None,
+        zero_division=0
+    )
+
     metrics = {
-        'loss': avg_loss,
-        'acc_global': (y_true == y_pred).mean(),
-        'acc_ponderada': balanced_accuracy_score(y_true, y_pred),
 
-        # Gerais
-        'f1_macro': f1_score(y_true, y_pred, average='macro', zero_division=0),
-        'precision_macro': precision_score(y_true, y_pred, average='macro', zero_division=0),
-        'recall_macro': recall_score(y_true, y_pred, average='macro', zero_division=0),
+        # losses
+        "loss": avg_loss,
 
-        # Por classe
-        'f1_benigno': f1_score(y_true, y_pred, pos_label=0, zero_division=0),
-        'precision_benigno': precision_score(y_true, y_pred, pos_label=0, zero_division=0),
-        'recall_benigno': recall_score(y_true, y_pred, pos_label=0, zero_division=0),
+        # accuracies
+        "acc_global": (y_true == y_pred).mean(),
+        "acc_ponderada": balanced_accuracy_score(
+            y_true,
+            y_pred
+        ),
 
-        'f1_maligno': f1_score(y_true, y_pred, pos_label=1, zero_division=0),
-        'precision_maligno': precision_score(y_true, y_pred, pos_label=1, zero_division=0),
-        'recall_maligno': recall_score(y_true, y_pred, pos_label=1, zero_division=0),
+        # macro metrics
+        "precision_macro": precision_score(
+            y_true,
+            y_pred,
+            average="macro",
+            zero_division=0
+        ),
 
-        'y_true': y_true,
-        'y_pred': y_pred,
-        'y_prob': y_prob,
+        "recall_macro": recall_score(
+            y_true,
+            y_pred,
+            average="macro",
+            zero_division=0
+        ),
 
-        'roc_auc': roc_auc,
-        'pr_auc': pr_auc,
+        "f1_macro": f1_score(
+            y_true,
+            y_pred,
+            average="macro",
+            zero_division=0
+        ),
+
+        # aucs
+        "roc_auc": roc_auc,
+        "pr_auc": pr_auc,
+
+        # per-class arrays
+        "precision_per_class": precision_per_class,
+        "recall_per_class": recall_per_class,
+        "f1_per_class": f1_per_class,
+
+        # raw outputs
+        "y_true": y_true,
+        "y_pred": y_pred,
+        "y_prob": y_prob
     }
+
     return metrics
 
-def fit(model, train_loader, val_loader, optimizer, criterion, device, epochs, model_type="", use_early_stopping=True, patience=5, log_every=5,student_run_tag='', output_dir='finalProject_outputs'):
+def log_roc_curve_multiclass(
+    y_true,
+    y_prob,
+    class_names=None
+):
+    """
+    Plots one-vs-rest ROC curves for a multiclass classifier.
+
+    Parameters
+    ----------
+    y_true : ndarray (N,)
+        True labels
+
+    y_prob : ndarray (N, C)
+        Predicted probabilities
+
+    class_names : list[str]
+        Names of the classes
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+    """
+
+    num_classes = y_prob.shape[1]
+
+    if class_names is None:
+        class_names = [
+            f"Class {i}"
+            for i in range(num_classes)
+        ]
+
+    y_true_bin = label_binarize(
+        y_true,
+        classes=np.arange(num_classes)
+    )
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+
+    roc_aucs = []
+
+    for i in range(num_classes):
+
+        fpr, tpr, _ = roc_curve(
+            y_true_bin[:, i], # type: ignore
+            y_prob[:, i]
+        )
+
+        roc_auc = auc(fpr, tpr)
+
+        roc_aucs.append(roc_auc)
+
+        ax.plot(
+            fpr,
+            tpr,
+            lw=2,
+            label=f"{class_names[i]} (AUC={roc_auc:.3f})"
+        )
+
+    macro_auc = np.mean(roc_aucs)
+
+    ax.plot(
+        [0, 1],
+        [0, 1],
+        linestyle="--",
+        alpha=0.7,
+        color="black",
+        label="Random"
+    )
+
+    ax.set_xlabel("False Positive Rate")
+    ax.set_ylabel("True Positive Rate")
+
+    ax.set_title(
+        f"Multiclass ROC Curves\nMacro AUC = {macro_auc:.3f}"
+    )
+
+    ax.legend(
+        loc="lower right",
+        fontsize=8
+    )
+
+    ax.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+
+    return fig
+
+def fit(model, train_loader, val_loader, optimizer, criterion, device, epochs, model_type="", use_early_stopping=True, patience=5, log_every=5,student_run_tag='', output_dir='finalProject_outputs', mean=None, std=None, class_names=class_names):
     from torch.utils.tensorboard import SummaryWriter 
     writer = SummaryWriter(log_dir=f'./{output_dir}/{student_run_tag}/runs/{model_type}')
 
@@ -316,32 +346,33 @@ def fit(model, train_loader, val_loader, optimizer, criterion, device, epochs, m
         }, epoch)
 
         writer.add_scalars(
-            f'{model_type}/F1',
+            f"{model_type}/Recall",
             {
-                'Geral': val_metrics['f1_macro'],
-                'Benigno': val_metrics['f1_benigno'],
-                'Maligno': val_metrics['f1_maligno']
+                cls_name: val_metrics["recall_per_class"][idx]
+                for idx, cls_name in enumerate(class_names)
             },
             epoch
         )
 
         writer.add_scalars(
-            f'{model_type}/Precision',
+            f"{model_type}/Precision",
             {
-                'Geral': val_metrics['precision_macro'],
-                'Benigno': val_metrics['precision_benigno'],
-                'Maligno': val_metrics['precision_maligno']
+                cls_name: val_metrics["precision_per_class"][idx]
+                for idx, cls_name in enumerate(class_names)
             },
             epoch
         )
 
+        f1_dict = {
+            cls_name: val_metrics["f1_per_class"][idx]
+            for idx, cls_name in enumerate(class_names)
+        }
+
+        f1_dict["Macro"] = val_metrics["f1_macro"]
+
         writer.add_scalars(
-            f'{model_type}/Recall',
-            {
-                'Geral': val_metrics['recall_macro'],
-                'Benigno': val_metrics['recall_benigno'],
-                'Maligno': val_metrics['recall_maligno']
-            },
+            f"{model_type}/F1",
+            f1_dict,
             epoch
         )
 
@@ -354,13 +385,14 @@ def fit(model, train_loader, val_loader, optimizer, criterion, device, epochs, m
 
         if (epoch + 1) % 5 == 0:
             try:
-                fig_roc = visu.log_roc_curve(
-                    val_metrics['y_true'],
-                    val_metrics['y_prob']
+                fig_roc = log_roc_curve_multiclass(
+                    val_metrics["y_true"],
+                    val_metrics["y_prob"],
+                    class_names
                 )
 
                 writer.add_figure(
-                    f'{model_type}/Visuals/ROC_Curve',
+                    f"{model_type}/Visuals/ROC_Curve",
                     fig_roc,
                     epoch
                 )
@@ -379,14 +411,25 @@ def fit(model, train_loader, val_loader, optimizer, criterion, device, epochs, m
 
         if (epoch + 1) % 5 == 0:
             try:
-                writer.add_pr_curve(
-                    f'{model_type}/Visuals/PR_Curve',
-                    torch.tensor(val_metrics['y_true']),
-                    torch.tensor(val_metrics['y_prob']),
-                    global_step=epoch
+
+                fig_pr = log_pr_curve_multiclass(
+                    val_metrics['y_true'],
+                    val_metrics['y_prob'],
+                    class_names
                 )
+
+                writer.add_figure(
+                    f'{model_type}/Visuals/PR_Curve',
+                    fig_pr,
+                    epoch
+                )
+
+                plt.close(fig_pr)
+
             except Exception as e:
-                print(f"Warning: não foi possível registrar curva precision-recall no tensorboard: {e}")
+                print(
+                    f"Warning: não foi possível registrar curva precision-recall no tensorboard: {e}"
+                )
 
         # Gráficos e Imagens
         try:
@@ -397,14 +440,27 @@ def fit(model, train_loader, val_loader, optimizer, criterion, device, epochs, m
             print(f"Warning: não foi possível registrar matriz de confusão no tensorboard: {e}")
         
         try:            
-            fig_erros = visu.plot_top_errors(model, val_loader, device, num_images=5)
-            writer.add_figure(f'{model_type}/Visuals/Top_Errors', fig_erros, epoch)
+            fig_erros = plot_top_errors_multiclass(
+                model=model,
+                loader=val_loader,
+                device=device,
+                num_images=10,
+                class_names=class_names,
+                mean=mean,
+                std=std
+            )
+
+            writer.add_figure(
+                f"{model_type}/Visuals/Top_Errors",
+                fig_erros,
+                epoch
+            )
             plt.close(fig_erros)
         except Exception as e:
             print(f"Warning: não foi possível registrar top erros no tensorboard: {e}")
 
         try:            
-            visu.log_gradcam_tensorboard(
+            log_gradcam_tensorboard(
                 writer=writer, 
                 model=model, 
                 loader=val_loader, 
@@ -417,23 +473,40 @@ def fit(model, train_loader, val_loader, optimizer, criterion, device, epochs, m
         except Exception as e:
             print(f"Warning: não foi possível registrar grad cam no tensorboard: {e}")
 
-        # Histograma  
+        # Histograma 
         y_true = val_metrics['y_true']
+        y_pred = val_metrics['y_pred']
         y_prob = val_metrics['y_prob']
 
-        # Benigno  -> concentrado próximo de 0
+        confidence = y_prob.max(axis=1)
+
         writer.add_histogram(
-            f'{model_type}/Probabilities/Benigno',
-            y_prob[y_true == 0],
+            f"{model_type}/Probabilities/Confidence",
+            confidence,
             epoch
         )
 
-        # Maligno  -> concentrado próximo de 1
+        correct_mask = (y_true == y_pred)
+
         writer.add_histogram(
-            f'{model_type}/Probabilities/Maligno',
-            y_prob[y_true == 1],
+            f"{model_type}/Confidence/Correct",
+            confidence[correct_mask],
             epoch
         )
+
+        writer.add_histogram(
+            f"{model_type}/Confidence/Wrong",
+            confidence[~correct_mask],
+            epoch
+        )
+
+        for cls_idx, cls_name in enumerate(class_names):
+
+            writer.add_histogram(
+                f"{model_type}/Probabilities/{cls_name}",
+                y_prob[:, cls_idx],
+                epoch
+            )
 
         if use_early_stopping and getattr(early_stopping, 'early_stop', False): # pyright: ignore[reportPossiblyUnboundVariable]
             print("Early stopping interrompendo o treino...")

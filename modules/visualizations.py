@@ -6,6 +6,18 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torchvision
+from sklearn.metrics import roc_curve, auc
+from sklearn.preprocessing import label_binarize
+
+class_names = [
+    "NV",
+    "MEL",
+    "BKL",
+    "BCC",
+    "AKIEC",
+    "VASC",
+    "DF"
+]
 
 def exibir_imagens_por_classe(loader, num_samples=3):
     """Exibe um número específico de imagens para cada classe presente no DataLoader.
@@ -92,8 +104,6 @@ def plot_roc(model, loader, device, model_name='', type='binary', num_classes=No
     """
     Plota a curva ROC para o modelo.
     """
-    from sklearn.metrics import roc_curve, auc
-    from sklearn.preprocessing import label_binarize
 
     y_true = []
     y_scores = []
@@ -534,5 +544,253 @@ def log_roc_curve(y_true, y_prob):
     ax.grid(True, alpha=0.3)
 
     fig.tight_layout()
+
+    return fig
+
+'''
+Visualizações multiclasse
+'''
+
+from sklearn.metrics import (
+    precision_recall_curve,
+    average_precision_score
+)
+
+def log_pr_curve_multiclass(
+    y_true,
+    y_prob,
+    class_names=None
+):
+    """
+    Plota curvas Precision-Recall One-vs-Rest para classificação multiclasse.
+
+    Parameters
+    ----------
+    y_true : ndarray (N,)
+        Labels verdadeiros.
+
+    y_prob : ndarray (N, C)
+        Probabilidades previstas.
+
+    class_names : list[str]
+        Nome das classes.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+    """
+
+    num_classes = y_prob.shape[1]
+
+    if class_names is None:
+        class_names = [
+            f"Class {i}"
+            for i in range(num_classes)
+        ]
+
+    y_true_bin = label_binarize(
+        y_true,
+        classes=np.arange(num_classes)
+    )
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+
+    ap_scores = []
+
+    for i in range(num_classes):
+
+        precision, recall, _ = precision_recall_curve(
+            y_true_bin[:, i],  # type: ignore
+            y_prob[:, i]
+        )
+
+        ap = average_precision_score(
+            y_true_bin[:, i], # type: ignore
+            y_prob[:, i]
+        )
+
+        ap_scores.append(ap)
+
+        ax.plot(
+            recall,
+            precision,
+            lw=2,
+            label=f"{class_names[i]} (AP={ap:.3f})"
+        )
+
+    mean_ap = np.mean(ap_scores)
+
+    ax.set_xlabel("Recall")
+    ax.set_ylabel("Precision")
+
+    ax.set_title(
+        f"Multiclass Precision-Recall Curves\nmAP = {mean_ap:.3f}"
+    )
+
+    ax.legend(
+        loc="lower left",
+        fontsize=8
+    )
+
+    ax.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+
+    return fig
+
+def plot_top_errors_multiclass(
+    model,
+    loader,
+    device,
+    num_images=10,
+    class_names=class_names,
+    mean=None,
+    std=None
+):
+    """
+    Mostra os erros mais confiantes do modelo em classificação multiclasse.
+
+    Cada imagem exibida corresponde a uma classificação incorreta,
+    ordenada pela confiança da predição errada.
+
+    Args:
+        model: modelo PyTorch
+        loader: DataLoader de validação/teste
+        device: cpu/cuda
+        num_images: quantidade de erros a exibir
+        class_names: lista com nomes das classes
+        mean: média usada na normalização
+        std: desvio padrão usado na normalização
+
+    Returns:
+        matplotlib.figure.Figure
+    """
+
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import torch
+
+    if class_names is None:
+        class_names = [str(i) for i in range(7)]
+
+    if mean is None:
+        mean = np.array([0.485, 0.456, 0.406])
+
+    if std is None:
+        std = np.array([0.229, 0.224, 0.225])
+
+    model.eval()
+
+    errors = []
+
+    with torch.no_grad():
+
+        for inputs, labels in loader:
+
+            inputs = inputs.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+
+            outputs = model(inputs)
+
+            probs = torch.softmax(outputs, dim=1)
+
+            pred_probs, preds = probs.max(dim=1)
+
+            for i in range(len(labels)):
+
+                true_y = labels[i].item()
+                pred_y = preds[i].item()
+
+                if true_y != pred_y:
+
+                    confidence = pred_probs[i].item()
+
+                    errors.append(
+                        (
+                            confidence,
+                            inputs[i].detach().cpu(),
+                            true_y,
+                            pred_y,
+                            probs[i].detach().cpu()
+                        )
+                    )
+
+    # Nenhum erro encontrado
+    if len(errors) == 0:
+
+        fig = plt.figure(figsize=(6, 4))
+        plt.text(
+            0.5,
+            0.5,
+            "Nenhum erro encontrado",
+            ha="center",
+            va="center",
+            fontsize=14
+        )
+        plt.axis("off")
+        return fig
+
+    # Ordena pelos erros mais confiantes
+    errors.sort(
+        key=lambda x: x[0],
+        reverse=True
+    )
+
+    top_errors = errors[:num_images]
+
+    # Layout
+    ncols = min(5, len(top_errors))
+    nrows = int(np.ceil(len(top_errors) / ncols))
+
+    fig, axes = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(4 * ncols, 4 * nrows)
+    )
+
+    axes = np.array(axes).reshape(-1)
+
+    # Desliga eixos não utilizados
+    for ax in axes:
+        ax.axis("off")
+
+    for idx, item in enumerate(top_errors):
+
+        confidence, img, true_y, pred_y, probs = item
+
+        img = img.numpy().transpose((1, 2, 0))
+
+        img = std * img + mean
+        img = np.clip(img, 0, 1)
+
+        ax = axes[idx]
+
+        ax.imshow(img)
+
+        # Top-2 probabilidades
+        top2_idx = torch.topk(probs, k=2).indices.numpy()
+        top2_probs = torch.topk(probs, k=2).values.numpy()
+
+        title = (
+            f"Real: {class_names[true_y]}\n"
+            f"Pred: {class_names[pred_y]} ({confidence:.1%})\n"
+            f"2º: {class_names[top2_idx[1]]} ({top2_probs[1]:.1%})"
+        )
+
+        ax.set_title(
+            title,
+            fontsize=9,
+            color="darkred"
+        )
+
+        ax.axis("off")
+
+    fig.suptitle(
+        "Top Misclassifications",
+        fontsize=16,
+        fontweight="bold"
+    )
+
+    plt.tight_layout()
 
     return fig

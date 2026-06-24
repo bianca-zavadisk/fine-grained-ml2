@@ -1,52 +1,69 @@
-'''
-FUNÇÕES DE TREINAMENTO
-'''
-
 import torch
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+from tqdm.auto import tqdm
+import numpy as np
+import matplotlib.pyplot as plt
+import modules.visualizations as visu
 
-class EarlyStopping:
-    def __init__(self, patience=5, min_delta=0, path='checkpoint.pt'):
+class GenericEarlyStopping:
+    def __init__(
+        self,
+        patience=5,
+        min_delta=0.0,
+        mode='max',  # 'max' para AUC, F1; 'min' para loss
+        path='checkpoint.pt'
+    ):
         self.patience = patience
         self.min_delta = min_delta
+        self.mode = mode
         self.path = path
+
         self.counter = 0
-        self.best_loss = None
+        self.best_score = None
         self.early_stop = False
 
-    def __call__(self, val_loss, model): # Removeu val_acc
-        if self.best_loss is None:
-            self.best_loss = val_loss
+    def __call__(self, current_score, model):
+
+        if self.best_score is None:
+            self.best_score = current_score
             self.save_checkpoint(model)
             return
 
-        # Verifica se a loss de validação diminuiu significativamente
-        if val_loss < self.best_loss - self.min_delta:
-            self.best_loss = val_loss
+        if self.mode == 'max':
+            improved = current_score > self.best_score + self.min_delta
+        else:
+            improved = current_score < self.best_score - self.min_delta
+
+        if improved:
+            self.best_score = current_score
+            self.counter = 0
             self.save_checkpoint(model)
-            self.counter = 0  # Reseta o contador se melhorou
         else:
             self.counter += 1
-            print(f"EarlyStopping counter: {self.counter} de {self.patience}")
+            print(f"EarlyStopping counter: {self.counter}/{self.patience}")
+
             if self.counter >= self.patience:
                 self.early_stop = True
 
     def save_checkpoint(self, model):
-        '''Salva o modelo quando há melhora na loss de validação.'''
-        import torch
         torch.save(model.state_dict(), self.path)
-        
-from tqdm import tqdm
 
 def train_one_epoch(model, loader, optimizer, criterion, device, epoch_idx=None, writer=None, model_type="model"):
     model.train()
 
     total_loss = 0.0
-    correct = 0
-    total = 0
+    
+    # Contadores globais
+    correct_global = 0
+    total_global = 0
+    
+    # Contadores por classe (0 = Benigno, 1 = Maligno)
+    correct_0 = 0
+    total_0 = 0
+    correct_1 = 0
+    total_1 = 0
 
     desc = f"Epoch {epoch_idx}" if epoch_idx else "Train"
-    loop = tqdm(loader, desc=desc, leave=False)
+    loop = tqdm(loader, desc=desc, total=len(loader), unit='batch', leave=False, dynamic_ncols=True)
 
     for batch_idx, (inputs, labels) in enumerate(loop, start=1):
         inputs = inputs.to(device, non_blocking=True)
@@ -60,79 +77,160 @@ def train_one_epoch(model, loader, optimizer, criterion, device, epoch_idx=None,
         optimizer.step()
 
         total_loss += loss.item() * inputs.size(0)
-        _, predicted = outputs.max(1)
+        
+        if outputs.dim() == 1 or outputs.shape[1] == 1:
+            probs = torch.sigmoid(outputs.view(-1))
+            predicted = (probs > 0.5).long()
+        else:
+            _, predicted = outputs.max(1)
 
-        predicted_cpu = predicted.cpu()
-        labels_cpu = labels.cpu()
+        # Usamos view(-1) para garantir tensores 1D, facilitando a lógica abaixo
+        predicted_cpu = predicted.cpu().view(-1)
+        labels_cpu = labels.cpu().view(-1)
 
-        total += labels_cpu.size(0)
-        correct += predicted_cpu.eq(labels_cpu).sum().item()
+        # --- 1. Acurácia Global ---
+        total_global += labels_cpu.size(0)
+        correct_global += predicted_cpu.eq(labels_cpu).sum().item()
 
-        current_loss = total_loss / total
-        current_acc = correct / total
-        loop.set_postfix(loss=f"{current_loss:.4f}", acc=f"{current_acc:.4f}")
+        # --- 2. Acurácia Ponderada (Otimizada para o loop) ---
+        mask_0 = (labels_cpu == 0)
+        mask_1 = (labels_cpu == 1)
+        
+        total_0 += mask_0.sum().item()
+        total_1 += mask_1.sum().item()
+        
+        correct_0 += (predicted_cpu[mask_0] == 0).sum().item()
+        correct_1 += (predicted_cpu[mask_1] == 1).sum().item()
+        
+        # Proteção contra divisão por zero nos primeiros batches
+        recall_0 = correct_0 / total_0 if total_0 > 0 else 0.0
+        recall_1 = correct_1 / total_1 if total_1 > 0 else 0.0
+        
+        current_loss = total_loss / total_global
+        current_acc_global = correct_global / total_global
+        current_acc_pond = (recall_0 + recall_1) / 2.0
+
+        # --- 3. Atualiza a barra de progresso ---
+        loop.set_postfix(
+            loss=f"{current_loss:.4f}", 
+            acc=f"{current_acc_global:.4f}", 
+            acc_pond=f"{current_acc_pond:.4f}"
+        )
 
         if writer is not None:
             global_step = (epoch_idx - 1) * len(loader) + batch_idx if epoch_idx else batch_idx
             writer.add_scalar(f'{model_type}/batch_loss', loss.item(), global_step)
-            if batch_idx == 1:
+            if batch_idx == 1 and epoch_idx == 1:
                 try:
                     imgs = inputs.detach().cpu()[:4]
                     writer.add_images(f'{model_type}/examples', imgs, epoch_idx)
                 except Exception:
                     pass
 
-        del outputs, loss, predicted, inputs, labels, predicted_cpu, labels_cpu
+        del outputs, loss, predicted, inputs, labels, predicted_cpu, labels_cpu, mask_0, mask_1
         if device.type == 'cuda':
             torch.cuda.empty_cache()
 
     avg_loss = total_loss / len(loader.dataset)
-    accuracy = correct / total
-    return avg_loss, accuracy
+    final_acc_global = correct_global / total_global
+    final_acc_pond = (recall_0 + recall_1) / 2.0 # pyright: ignore[reportPossiblyUnboundVariable, reportOperatorIssue]
+    
+    # Agora a função retorna também a acurácia ponderada de treino final
+    return avg_loss, final_acc_global, final_acc_pond
 
+from sklearn.metrics import balanced_accuracy_score, f1_score, precision_score, recall_score, roc_auc_score, average_precision_score
 
 @torch.no_grad()
 def evaluate(model, loader, criterion, device):
     model.eval()
 
     total_loss = 0.0
-    correct = 0
-    total = 0
+    all_targets = []
+    all_preds = []
+    all_probs = []
 
     for inputs, labels in loader:
-        inputs, labels = inputs.to(device), labels.to(device)
+        inputs, labels = inputs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
 
         outputs = model(inputs)
         loss = criterion(outputs, labels)
 
         total_loss += loss.item() * inputs.size(0)
         
-        _, predicted = outputs.max(1)
-        predicted = predicted.cpu()
-        labels_cpu = labels.cpu()
+        # Extrai probabilidades para a classe positiva (maligno)
+        if outputs.dim() == 1 or outputs.shape[1] == 1:
+            probs = torch.sigmoid(outputs.view(-1))
+            preds = (probs > 0.5).long()
+            probs_pos = probs
+        else:
+            probs = torch.softmax(outputs, dim=1)
+            preds = outputs.argmax(dim=1)
+            probs_pos = probs[:, 1]
 
-        total += labels_cpu.size(0)
-        correct += predicted.eq(labels_cpu).sum().item()
+        all_targets.extend(labels.cpu().numpy())
+        all_preds.extend(preds.cpu().numpy())
+        all_probs.extend(probs_pos.cpu().numpy())
 
-        del outputs, loss, predicted, labels, inputs, labels_cpu
+        del outputs, loss, inputs, labels
         if device.type == 'cuda':
             torch.cuda.empty_cache()
 
     avg_loss = total_loss / len(loader.dataset)
-    accuracy = correct / total
-    return avg_loss, accuracy
+    
+    y_true = np.array(all_targets)
+    y_pred = np.array(all_preds)
+    y_prob = np.array(all_probs)
 
-def fit(model, train_loader, val_loader, optimizer, criterion, device, epochs, model_type="", use_early_stopping = True, patience=5, log_every=5, student_run_tag='', output_dir='finalProject_outputs'):
+    try:
+        roc_auc = roc_auc_score(y_true, y_prob)
+    except ValueError:
+        roc_auc = 0.0
+
+    try:
+        pr_auc = average_precision_score(y_true, y_prob)
+    except ValueError:
+        pr_auc = 0.0
+    
+    # Gera todas as métricas necessárias para dados desbalanceados
+    metrics = {
+        'loss': avg_loss,
+        'acc_global': (y_true == y_pred).mean(),
+        'acc_ponderada': balanced_accuracy_score(y_true, y_pred),
+
+        # Gerais
+        'f1_macro': f1_score(y_true, y_pred, average='macro', zero_division=0),
+        'precision_macro': precision_score(y_true, y_pred, average='macro', zero_division=0),
+        'recall_macro': recall_score(y_true, y_pred, average='macro', zero_division=0),
+
+        # Por classe
+        'f1_benigno': f1_score(y_true, y_pred, pos_label=0, zero_division=0),
+        'precision_benigno': precision_score(y_true, y_pred, pos_label=0, zero_division=0),
+        'recall_benigno': recall_score(y_true, y_pred, pos_label=0, zero_division=0),
+
+        'f1_maligno': f1_score(y_true, y_pred, pos_label=1, zero_division=0),
+        'precision_maligno': precision_score(y_true, y_pred, pos_label=1, zero_division=0),
+        'recall_maligno': recall_score(y_true, y_pred, pos_label=1, zero_division=0),
+
+        'y_true': y_true,
+        'y_pred': y_pred,
+        'y_prob': y_prob,
+
+        'roc_auc': roc_auc,
+        'pr_auc': pr_auc,
+    }
+    return metrics
+
+def fit(model, train_loader, val_loader, optimizer, criterion, device, epochs, model_type="", use_early_stopping=True, patience=5, log_every=5,student_run_tag='', output_dir='finalProject_outputs'):
     from torch.utils.tensorboard import SummaryWriter 
     writer = SummaryWriter(log_dir=f'./{output_dir}/{student_run_tag}/runs/{model_type}')
 
     history = {
-        'train_loss': [], 'train_acc': [],
-        'val_loss': [], 'val_acc': []
+        'train_loss': [], 'train_acc_global': [], 'train_acc_ponderada': [],
+        'val_loss': [], 'val_acc_global': [], 'val_acc_ponderada': []
     }
 
     if use_early_stopping:
-        early_stopping = EarlyStopping(patience=patience, path=f'./{output_dir}/{student_run_tag}/best_model_{model_type}.pth')
+        early_stopping = GenericEarlyStopping(patience=patience, mode='max', path=f'./{output_dir}/{student_run_tag}/best_model_{model_type}.pth')
 
     def _confusion_matrix_figure(y_true, y_pred, class_map=None, normalize=True, cmap='Blues'):
         import numpy as _np
@@ -176,180 +274,182 @@ def fit(model, train_loader, val_loader, optimizer, criterion, device, epochs, m
         return fig
 
     for epoch in range(epochs):
-        train_loss, train_acc = train_one_epoch(
+        # 1. Executa Treinamento
+        train_loss, train_acc_global, train_acc_pond = train_one_epoch(
             model, train_loader, optimizer, criterion, device,
             epoch_idx=epoch+1, writer=writer, model_type=model_type
         )
-        val_loss, val_acc = evaluate(model, val_loader, criterion, device)
+        
+        # 2. Executa Validação
+        val_metrics = evaluate(model, val_loader, criterion, device)
 
+        # 3. Atualiza Histórico
         history['train_loss'].append(train_loss)
-        history['train_acc'].append(train_acc)
-        history['val_loss'].append(val_loss)
-        history['val_acc'].append(val_acc)
+        history['train_acc_global'].append(train_acc_global)
+        history['train_acc_ponderada'].append(train_acc_pond)
+        history['val_loss'].append(val_metrics['loss'])
+        history['val_acc_global'].append(val_metrics['acc_global'])
+        history['val_acc_ponderada'].append(val_metrics['acc_ponderada'])
 
         if ((epoch + 1) % log_every == 0) or (epoch + 1 == epochs) or (epoch + 1 == 1):
             print(f"Epoch {epoch+1}/{epochs}: "
-                f"Train Loss: {train_loss:.4f} | Acc: {train_acc:.4f} | "
-                f"Val Loss: {val_loss:.4f} | Acc: {val_acc:.4f}")
+                f"Train Loss: {train_loss:.4f} | Acc: {train_acc_global:.4f} | Acc Pond.: {train_acc_pond:.4f} "
+                f"Val Loss: {val_metrics['loss']:.4f} | "
+                f"Val Acc Global: {val_metrics['acc_global']:.4f} | "
+                f"Val Acc Pond: {val_metrics['acc_ponderada']:.4f}")
 
         if use_early_stopping:
-            early_stopping(val_loss, model) # type: ignore
+            early_stopping(val_metrics['pr_auc'], model) # pyright: ignore[reportPossiblyUnboundVariable]
 
-        writer.add_scalar(f'{model_type}/train_loss', train_loss, epoch) 
-        writer.add_scalar(f'{model_type}/train_acc', train_acc, epoch) 
-        writer.add_scalar(f'{model_type}/val_loss', val_loss, epoch) 
-        writer.add_scalar(f'{model_type}/val_acc', val_acc, epoch)
+        # 4. Gravação no TensorBoard
+        writer.add_scalars(f'{model_type}/Loss_Comparison', {
+            'Train_Loss': train_loss,
+            'Val_Loss': val_metrics['loss']
+        }, epoch)
+        
+        # Adiciona o gráfico comparativo das acurácias
+        writer.add_scalars(f'{model_type}/Accuracy_Comparison', {
+            'Train_Global': train_acc_global,
+            'Train_Ponderada': train_acc_pond,
+            'Val_Global': val_metrics['acc_global'],
+            'Val_Ponderada': val_metrics['acc_ponderada']
+        }, epoch)
 
-        # calcula e registra matriz de confusão da validação no tensorboard
+        writer.add_scalars(
+            f'{model_type}/F1',
+            {
+                'Geral': val_metrics['f1_macro'],
+                'Benigno': val_metrics['f1_benigno'],
+                'Maligno': val_metrics['f1_maligno']
+            },
+            epoch
+        )
+
+        writer.add_scalars(
+            f'{model_type}/Precision',
+            {
+                'Geral': val_metrics['precision_macro'],
+                'Benigno': val_metrics['precision_benigno'],
+                'Maligno': val_metrics['precision_maligno']
+            },
+            epoch
+        )
+
+        writer.add_scalars(
+            f'{model_type}/Recall',
+            {
+                'Geral': val_metrics['recall_macro'],
+                'Benigno': val_metrics['recall_benigno'],
+                'Maligno': val_metrics['recall_maligno']
+            },
+            epoch
+        )
+
+        # ROC AUC and Curve
+        writer.add_scalar(
+            f'{model_type}/Metrics/ROC_AUC',
+            val_metrics['roc_auc'],
+            epoch
+        )
+
+        if (epoch + 1) % 5 == 0:
+            try:
+                fig_roc = visu.log_roc_curve(
+                    val_metrics['y_true'],
+                    val_metrics['y_prob']
+                )
+
+                writer.add_figure(
+                    f'{model_type}/Visuals/ROC_Curve',
+                    fig_roc,
+                    epoch
+                )
+
+                plt.close(fig_roc)
+
+            except Exception as e:
+                print(f"Warning: erro ao registrar ROC curve: {e}")
+
+        # PR AUC and Curve
+        writer.add_scalar(
+            f'{model_type}/Metrics/PR_AUC',
+            val_metrics['pr_auc'],
+            epoch
+        )
+
+        if (epoch + 1) % 5 == 0:
+            try:
+                writer.add_pr_curve(
+                    f'{model_type}/Visuals/PR_Curve',
+                    torch.tensor(val_metrics['y_true']),
+                    torch.tensor(val_metrics['y_prob']),
+                    global_step=epoch
+                )
+            except Exception as e:
+                print(f"Warning: não foi possível registrar curva precision-recall no tensorboard: {e}")
+
+        # Gráficos e Imagens
         try:
-            import numpy as np
-            model.eval()
-            y_true = []
-            y_pred = []
-            with torch.no_grad():
-                for inputs, labels in val_loader:
-                    inputs = inputs.to(device, non_blocking=True)
-                    labels = labels.to(device, non_blocking=True)
-                    outputs = model(inputs)
-
-                    if outputs.dim() == 1 or outputs.shape[1] == 1:
-                        probs = torch.sigmoid(outputs.view(-1))
-                        preds = (probs > 0.5).long().cpu().numpy()
-                    else:
-                        preds = outputs.argmax(dim=1).cpu().numpy()
-
-                    y_pred.append(preds)
-                    y_true.append(labels.cpu().numpy())
-
-                    del outputs, inputs, labels
-                    if device.type == 'cuda':
-                        torch.cuda.empty_cache()
-
-            if len(y_true) > 0:
-                y_true = np.concatenate(y_true)
-                y_pred = np.concatenate(y_pred)
-                fig = _confusion_matrix_figure(y_true, y_pred, normalize=True)
-                writer.add_figure(f'{model_type}/confusion_matrix', fig, epoch)
-                import matplotlib.pyplot as plt
-                plt.close(fig)
+            fig = _confusion_matrix_figure(val_metrics['y_true'], val_metrics['y_pred'], normalize=True)
+            writer.add_figure(f'{model_type}/Visuals/Confusion_Matrix', fig, epoch)
+            plt.close(fig)
         except Exception as e:
             print(f"Warning: não foi possível registrar matriz de confusão no tensorboard: {e}")
+        
+        try:            
+            fig_erros = visu.plot_top_errors(model, val_loader, device, num_images=5)
+            writer.add_figure(f'{model_type}/Visuals/Top_Errors', fig_erros, epoch)
+            plt.close(fig_erros)
+        except Exception as e:
+            print(f"Warning: não foi possível registrar top erros no tensorboard: {e}")
 
-        if use_early_stopping and early_stopping.early_stop: # type: ignore
+        try:            
+            visu.log_gradcam_tensorboard(
+                writer=writer, 
+                model=model, 
+                loader=val_loader, 
+                device=device, 
+                epoch=epoch, 
+                model_type=model_type,
+                num_images=4,
+                is_binary_loss=False # <-- Ajuste isso de acordo com a sua Loss
+            )
+        except Exception as e:
+            print(f"Warning: não foi possível registrar grad cam no tensorboard: {e}")
+
+        # Histograma  
+        y_true = val_metrics['y_true']
+        y_prob = val_metrics['y_prob']
+
+        # Benigno  -> concentrado próximo de 0
+        writer.add_histogram(
+            f'{model_type}/Probabilities/Benigno',
+            y_prob[y_true == 0],
+            epoch
+        )
+
+        # Maligno  -> concentrado próximo de 1
+        writer.add_histogram(
+            f'{model_type}/Probabilities/Maligno',
+            y_prob[y_true == 1],
+            epoch
+        )
+
+        if use_early_stopping and getattr(early_stopping, 'early_stop', False): # pyright: ignore[reportPossiblyUnboundVariable]
             print("Early stopping interrompendo o treino...")
             break
 
-    # Carrega o melhor estado do modelo antes de retornar
-    # if use_early_stopping:
-    #     model.load_state_dict(torch.load(f'./{output_dir}/{student_run_tag}/best_model_{model_type}.pth'))
+        # if use_early_stopping:
+        #     try:
+        #         best_path = early_stopping.path
+        #         from pathlib import Path as _Path
+        #         if _Path(best_path).exists():
+        #             model.load_state_dict(torch.load(best_path, map_location=device))
+        #             print(f"Melhor modelo carregado de: {best_path}")
+        #         else:
+        #             print(f"Aviso: checkpoint não encontrado em {best_path}")
+        #     except Exception as e:
+        #         print(f"Warning: falha ao carregar melhor modelo: {e}")
 
     writer.close()
-
     return history
-
-'''
-FUNÇÕES DE AVALIAÇÃO
-'''
-
-def evaluate_classification(model, loader, device=device):
-    """
-    Avalia o modelo sobre o loader e computa métricas agregadas:
-    accuracy, balanced_accuracy, precision/recall/f1 por classe, confusion matrix e ROC AUC (quando aplicável).
-    Retorna um dict com as métricas.
-    """
-    model.eval()
-    all_preds = []
-    all_probs = []
-    all_labels = []
-
-    with torch.no_grad():
-        for images, labels in loader:
-            images = images.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
-
-            outputs = model(images)
-
-            # trata casos binário (1 saída ou 2 saídas) e multiclass (>=2 saídas)
-            if outputs.dim() == 1 or outputs.shape[1] == 1:
-                probs = torch.sigmoid(outputs.view(-1))
-                preds = (probs > 0.5).long()
-                all_probs.append(probs.cpu())
-                all_preds.append(preds.cpu())
-            else:
-                probs_all = torch.softmax(outputs, dim=1)
-                preds = outputs.argmax(dim=1)
-                # para problema binário multiclass-style, pega prob da classe 1
-                if outputs.shape[1] == 2:
-                    all_probs.append(probs_all[:, 1].cpu())
-                else:
-                    all_probs.append(probs_all.cpu())  # multiclass scores, usado apenas se necessário
-                all_preds.append(preds.cpu())
-
-            all_labels.append(labels.cpu())
-
-            del outputs, images, labels
-            if device.type == 'cuda':
-                torch.cuda.empty_cache()
-
-    import numpy as np
-    from sklearn.metrics import (accuracy_score, balanced_accuracy_score,
-                                 precision_recall_fscore_support,
-                                 confusion_matrix, roc_auc_score, classification_report)
-
-    y_true = np.concatenate([t.numpy() for t in all_labels])
-    y_pred = np.concatenate([t.numpy() for t in all_preds])
-
-    metrics = {}
-    metrics['accuracy'] = float(accuracy_score(y_true, y_pred))
-    metrics['balanced_accuracy'] = float(balanced_accuracy_score(y_true, y_pred))
-
-    # per-class precision/recall/f1 and support
-    precisions, recalls, f1s, supports = precision_recall_fscore_support(y_true, y_pred, average=None, zero_division=0)
-    per_class = {}
-    classes = np.unique(np.concatenate([y_true, y_pred]))
-    for i, cls in enumerate(classes):
-        per_class[int(cls)] = {
-            'precision': float(precisions[i]), # type: ignore
-            'recall': float(recalls[i]), # type: ignore
-            'f1': float(f1s[i]), # type: ignore
-            'support': int(supports[i]) # type: ignore
-        }
-    metrics['per_class'] = per_class
-
-    # aggregated macro/binary metrics
-    avg = 'binary' if len(classes) == 2 else 'macro'
-    precision, recall, f1, _ = precision_recall_fscore_support(y_true, y_pred, average=avg, zero_division=0)
-    metrics.update({'precision': float(precision), 'recall': float(recall), 'f1': float(f1)})
-
-    metrics['confusion_matrix'] = confusion_matrix(y_true, y_pred).tolist()
-
-    # tenta ROC AUC quando for binário e tivermos scores adequados
-    try:
-        if len(all_probs) > 0:
-            probs_cat = np.concatenate([p.numpy() for p in all_probs])
-            if probs_cat.ndim == 1:
-                metrics['roc_auc'] = float(roc_auc_score(y_true, probs_cat))
-            elif probs_cat.ndim == 2 and probs_cat.shape[1] == 2:
-                metrics['roc_auc'] = float(roc_auc_score(y_true, probs_cat[:, 1]))
-            else:
-                metrics['roc_auc'] = None
-        else:
-            metrics['roc_auc'] = None
-    except Exception:
-        metrics['roc_auc'] = None
-
-    # relatório resumido
-    print(f"Accuracy: {metrics['accuracy']:.4f}")
-    print(f"Balanced Accuracy: {metrics['balanced_accuracy']:.4f}")
-    print(f"Precision ({avg}): {metrics['precision']:.4f}")
-    print(f"Recall ({avg}): {metrics['recall']:.4f}")
-    print(f"F1 ({avg}): {metrics['f1']:.4f}")
-    if metrics['roc_auc'] is not None:
-        print(f"ROC AUC: {metrics['roc_auc']:.4f}")
-    print("Confusion matrix:")
-    print(np.array(metrics['confusion_matrix']))
-    print("Per-class metrics:")
-    for cls, m in metrics['per_class'].items():
-        print(f" Class {cls}: precision={m['precision']:.3f}, recall={m['recall']:.3f}, f1={m['f1']:.3f}, support={m['support']}")
-
-    return metrics
