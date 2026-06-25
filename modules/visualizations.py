@@ -19,7 +19,7 @@ class_names = [
     "DF"
 ]
 
-def exibir_imagens_por_classe(loader, num_samples=3):
+def exibir_imagens_por_classe(loader, num_samples=3, mean=None, std=None):
     """Exibe um número específico de imagens para cada classe presente no DataLoader.
 
     :param loader: PyTorch DataLoader
@@ -80,7 +80,15 @@ def exibir_imagens_por_classe(loader, num_samples=3):
             img = imagens[idx_img]
 
             if isinstance(img, torch.Tensor):
-                img = img.permute(1, 2, 0).cpu().numpy()    # (C, H, W) -> (H, W, C)
+                img = img.permute(1, 2, 0).cpu().numpy()
+
+                if mean is not None and std is not None:
+                    mean_np = np.array(mean).reshape(1, 1, -1)
+                    std_np = np.array(std).reshape(1, 1, -1)
+
+                    img = img * std_np + mean_np
+
+                img = np.clip(img, 0, 1)
 
             if img.shape[-1] == 1:
                 ax.imshow(img.squeeze(), cmap="gray")
@@ -147,9 +155,9 @@ def plot_roc(model, loader, device, model_name='', type='binary', num_classes=No
         # espera y_scores shape (N, C)
         if y_scores.ndim == 1:
             raise RuntimeError("Esperado scores multiclass NxC, mas recebeu vetor unidimensional.")
-        y_test_bin = label_binarize(y_true, classes=np.arange(n_classes))
+        y_test_bin = label_binarize(y_true, classes=np.arange(n_classes)) # type: ignore
         fpr = dict(); tpr = dict(); roc_auc = dict()
-        for i in range(n_classes):
+        for i in range(n_classes): # type: ignore
             fpr[i], tpr[i], _ = roc_curve(y_test_bin[:, i], y_scores[:, i]) # type: ignore
             roc_auc[i] = auc(fpr[i], tpr[i])
         fpr["micro"], tpr["micro"], _ = roc_curve(y_test_bin.ravel(), y_scores.ravel()) # type: ignore
@@ -158,7 +166,7 @@ def plot_roc(model, loader, device, model_name='', type='binary', num_classes=No
         plt.figure(figsize=(10, 8))
         plt.plot(fpr["micro"], tpr["micro"], label=f'Micro-average ROC (AUC = {roc_auc["micro"]:.2f})', color='deeppink', linestyle=':', linewidth=4)
         colors = ['blue', 'green', 'red', 'cyan', 'magenta', 'yellow', 'black']
-        for i, color in zip(range(n_classes), colors):
+        for i, color in zip(range(n_classes), colors): # type: ignore
             plt.plot(fpr[i], tpr[i], color=color, lw=2, label=f'Class {i} ROC (AUC = {roc_auc[i]:.2f})')
         plt.plot([0, 1], [0, 1], 'k--', lw=2)
         plt.xlim([0.0, 1.0]); plt.ylim([0.0, 1.05])
@@ -286,7 +294,7 @@ def plot_confusion_matrix(model, loader, device, model_name='', classes=None, no
         # sem class_map: comportamento anterior
         if classes is None:
             try:
-                classes = list(range(num_classes))
+                classes = list(range(num_classes)) # type: ignore
             except Exception:
                 classes = np.unique(np.concatenate([y_true, y_pred])).tolist()
         # se classes são ints, usa-os como rótulos simples
@@ -416,10 +424,13 @@ def plot_top_errors(model, loader, device, num_images=5, class_names=['Benigno',
         save_dir = f'./{output_dir}/{student_run_tag}'
         file_path = f'{save_dir}/confusion_matrix_{model_name}.png'
         plt.savefig(file_path)
-    
         plt.show()
     
-    return fig
+    try:
+        return fig
+    except Exception:
+        plt.close(fig)
+        raise
 
 from pytorch_grad_cam import GradCAM
 from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget, BinaryClassifierOutputTarget

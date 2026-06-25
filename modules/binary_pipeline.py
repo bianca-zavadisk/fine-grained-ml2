@@ -220,7 +220,7 @@ def evaluate(model, loader, criterion, device):
     }
     return metrics
 
-def fit(model, train_loader, val_loader, optimizer, criterion, device, epochs, model_type="", use_early_stopping=True, patience=5, log_every=5,student_run_tag='', output_dir='finalProject_outputs'):
+def fit(model, train_loader, val_loader, optimizer, criterion, device, epochs, model_type="", use_early_stopping=True, patience=5, log_every=5,student_run_tag='', output_dir='finalProject_outputs', mean=None, std=None):
     from torch.utils.tensorboard import SummaryWriter 
     writer = SummaryWriter(log_dir=f'./{output_dir}/{student_run_tag}/runs/{model_type}')
 
@@ -397,7 +397,7 @@ def fit(model, train_loader, val_loader, optimizer, criterion, device, epochs, m
             print(f"Warning: não foi possível registrar matriz de confusão no tensorboard: {e}")
         
         try:            
-            fig_erros = visu.plot_top_errors(model, val_loader, device, num_images=5)
+            fig_erros = visu.plot_top_errors(model, val_loader, device, num_images=5, mean=mean, std=std)
             writer.add_figure(f'{model_type}/Visuals/Top_Errors', fig_erros, epoch)
             plt.close(fig_erros)
         except Exception as e:
@@ -412,7 +412,9 @@ def fit(model, train_loader, val_loader, optimizer, criterion, device, epochs, m
                 epoch=epoch, 
                 model_type=model_type,
                 num_images=4,
-                is_binary_loss=False # <-- Ajuste isso de acordo com a sua Loss
+                is_binary_loss=False, # <-- Ajuste isso de acordo com a sua Loss
+                mean=mean,
+                std=std
             )
         except Exception as e:
             print(f"Warning: não foi possível registrar grad cam no tensorboard: {e}")
