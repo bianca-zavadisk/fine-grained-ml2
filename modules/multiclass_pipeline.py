@@ -12,7 +12,7 @@ class_names = [
     "NV",
     "BCC",
     "AKIEC",
-    "BLK",
+    "BKL",
     "DF",
     "VASC"
 ]
