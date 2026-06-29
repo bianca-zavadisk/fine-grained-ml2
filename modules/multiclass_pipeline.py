@@ -250,9 +250,10 @@ def log_roc_curve_multiclass(
 
     return fig
 
-def fit(model, train_loader, val_loader, optimizer, criterion, device, epochs, model_type="", use_early_stopping=True, patience=5, log_every=5,student_run_tag='', output_dir='finalProject_outputs', mean=None, std=None, class_names=class_names):
+def fit(model, train_loader, val_loader, optimizer, criterion, device, epochs, model_type="", use_early_stopping=True, patience=5, log_every=5,student_run_tag='', output_dir='finalProject_outputs', mean=None, std=None, class_names=class_names, initial_epoch=0, writer=None):
     from torch.utils.tensorboard import SummaryWriter 
-    writer = SummaryWriter(log_dir=f'./{output_dir}/{student_run_tag}/runs/{model_type}')
+    if writer is None:
+        writer = SummaryWriter(log_dir=f'./{output_dir}/{student_run_tag}/runs/{model_type}')
 
     history = {
         'train_loss': [], 'train_acc_global': [], 'train_acc_ponderada': [],
@@ -303,7 +304,8 @@ def fit(model, train_loader, val_loader, optimizer, criterion, device, epochs, m
         fig.tight_layout()
         return fig
 
-    for epoch in range(epochs):
+    for epoch in range(initial_epoch, initial_epoch + epochs):
+        local_epoch = epoch - initial_epoch
         # 1. Executa Treinamento
         train_loss, train_acc_global, train_acc_pond = train_one_epoch(
             model, train_loader, optimizer, criterion, device,
@@ -322,7 +324,7 @@ def fit(model, train_loader, val_loader, optimizer, criterion, device, epochs, m
         history['val_acc_ponderada'].append(val_metrics['acc_ponderada'])
 
         if ((epoch + 1) % log_every == 0) or (epoch + 1 == epochs) or (epoch + 1 == 1):
-            print(f"Epoch {epoch+1}/{epochs}: "
+            print(f"Epoch {epoch+1}/{initial_epoch + epochs}:: "
                 f"Train Loss: {train_loss:.4f} | Acc: {train_acc_global:.4f} | Acc Pond.: {train_acc_pond:.4f} "
                 f"Val Loss: {val_metrics['loss']:.4f} | "
                 f"Val Acc Global: {val_metrics['acc_global']:.4f} | "
