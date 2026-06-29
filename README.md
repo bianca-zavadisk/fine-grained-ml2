@@ -34,10 +34,6 @@ Trabalho final para a disciplina Aprendizado de Máquina 2 (ML2) do IMPA Tech �
 - [isic2018_dataset.py](isic2018_dataset.py)
 - [ISIC2018_Task3_Training_GroundTruth.csv](ISIC2018_Task3_Training_GroundTruth.csv)
 - [ISIC2018_Task3_Training_LesionGroupings.csv](ISIC2018_Task3_Training_LesionGroupings.csv)
-- [src/__init__.py](src/__init__.py)
-- [src/util.py](src/util.py)
-- [previous_proj_examples/classificacao_com_cnn.ipynb](previous_proj_examples/classificacao_com_cnn.ipynb)
-- [previous_proj_examples/vae_watermark.ipynb](previous_proj_examples/vae_watermark.ipynb)
 
 ## Como configurar o ambiente (reprodução)
 1. Clonar o repositório:
