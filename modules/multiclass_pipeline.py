@@ -470,7 +470,9 @@ def fit(model, train_loader, val_loader, optimizer, criterion, device, epochs, m
                 epoch=epoch, 
                 model_type=model_type,
                 num_images=4,
-                is_binary_loss=False # <-- Ajuste isso de acordo com a sua Loss
+                is_binary_loss=False, # <-- Ajuste isso de acordo com a sua Loss
+                mean=mean,
+                std=std
             )
         except Exception as e:
             print(f"Warning: não foi possível registrar grad cam no tensorboard: {e}")
