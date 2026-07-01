@@ -331,7 +331,7 @@ def fit(model, train_loader, val_loader, optimizer, criterion, device, epochs, m
                 f"Val Acc Pond: {val_metrics['acc_ponderada']:.4f}")
 
         if use_early_stopping:
-            early_stopping(val_metrics['pr_auc'], model) # pyright: ignore[reportPossiblyUnboundVariable]
+            early_stopping(val_metrics['acc_ponderada'], model) # pyright: ignore[reportPossiblyUnboundVariable]
 
         # 4. Gravação no TensorBoard
         writer.add_scalars(f'{model_type}/Loss_Comparison', {
